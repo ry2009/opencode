@@ -193,7 +193,7 @@ export namespace File {
       const untrackedFiles = untrackedOutput.trim().split("\n")
       for (const filepath of untrackedFiles) {
         const full = path.join(Instance.directory, filepath)
-        const stat = await fs.promises.stat(full).catch(() => undefined)
+        const stat = await Bun.file(full).stat().catch(() => undefined)
         if (!stat) continue
         changedFiles.push({
           path: filepath,
