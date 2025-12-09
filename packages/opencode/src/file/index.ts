@@ -192,18 +192,15 @@ export namespace File {
     if (untrackedOutput.trim()) {
       const untrackedFiles = untrackedOutput.trim().split("\n")
       for (const filepath of untrackedFiles) {
-        try {
-          const content = await Bun.file(path.join(Instance.directory, filepath)).text()
-          const lines = content.split("\n").length
-          changedFiles.push({
-            path: filepath,
-            added: lines,
-            removed: 0,
-            status: "added",
-          })
-        } catch {
-          continue
-        }
+        const full = path.join(Instance.directory, filepath)
+        const stat = await fs.promises.stat(full).catch(() => undefined)
+        if (!stat) continue
+        changedFiles.push({
+          path: filepath,
+          added: 0,
+          removed: 0,
+          status: "added",
+        })
       }
     }
 
