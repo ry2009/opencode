@@ -83,7 +83,7 @@ export namespace Session {
       const list = index.byParent.get(session.parentID) ?? []
       const found = list.findIndex((x) => x.id === session.id)
       if (found === -1) list.push(session)
-      else list[found] = session
+      if (found !== -1) list[found] = session
       list.sort((a, b) => b.id.localeCompare(a.id))
       index.byParent.set(session.parentID, list)
     }
