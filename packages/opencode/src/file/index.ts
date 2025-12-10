@@ -169,6 +169,23 @@ export namespace File {
   }
 
   const lineCache = new Map<string, LineCache>()
+  const cacheFile = path.join(Instance.directory, ".opencode-line-cache.json")
+
+  async function loadCache() {
+    const file = Bun.file(cacheFile)
+    if (!(await file.exists())) return
+    const json = await file.json().catch(() => undefined)
+    if (!json) return
+    for (const [k, v] of Object.entries(json as Record<string, LineCache>)) {
+      lineCache.set(k, v)
+    }
+  }
+
+  async function saveCache() {
+    const obj: Record<string, LineCache> = {}
+    for (const [k, v] of lineCache.entries()) obj[k] = v
+    await Bun.write(cacheFile, JSON.stringify(obj))
+  }
 
   function cacheKey(path: string) {
     return path
@@ -176,6 +193,7 @@ export namespace File {
 
   function setCachedLines(path: string, size: number, mtime: number, lines: number) {
     lineCache.set(cacheKey(path), { size, mtime, lines })
+    saveCache().catch(() => {})
   }
 
   function getCachedLines(path: string, size: number, mtime: number) {
@@ -199,7 +217,8 @@ export namespace File {
     return lines
   }
 
-  function scheduleCount(path: string, size: number, mtime: number) {
+  function scheduleCount(path: string, size: number, mtime: number, cap: number) {
+    if (size > cap) return
     countLinesStream(path)
       .then((lines) => setCachedLines(path, size, mtime, lines))
       .catch(() => {})
@@ -208,6 +227,8 @@ export namespace File {
   export async function status() {
     const project = Instance.project
     if (project.vcs !== "git") return []
+
+    await loadCache()
 
     const diffOutput = await $`git diff --numstat HEAD`.cwd(Instance.directory).quiet().nothrow().text()
 
@@ -235,6 +256,7 @@ export namespace File {
     if (untrackedOutput.trim()) {
       const untrackedFiles = untrackedOutput.trim().split("\n")
       const limit = 5_000_000
+      const streamCap = 100_000_000
       for (const filepath of untrackedFiles) {
         const full = path.join(Instance.directory, filepath)
         const stat = await Bun.file(full).stat().catch(() => undefined)
@@ -258,7 +280,7 @@ export namespace File {
           added = (await bunFile.text().catch(() => "")).split("\n").length
         }
         if (added === 0) {
-          scheduleCount(full, size, mtime)
+          scheduleCount(full, size, mtime, streamCap)
         }
         changedFiles.push({
           path: filepath,
