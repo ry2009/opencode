@@ -191,13 +191,18 @@ export namespace File {
 
     if (untrackedOutput.trim()) {
       const untrackedFiles = untrackedOutput.trim().split("\n")
+      const limit = 5_000_000
       for (const filepath of untrackedFiles) {
         const full = path.join(Instance.directory, filepath)
         const stat = await Bun.file(full).stat().catch(() => undefined)
         if (!stat) continue
+        const added =
+          stat.size <= limit
+            ? (await Bun.file(full).text().catch(() => "")).split("\n").length
+            : 0
         changedFiles.push({
           path: filepath,
-          added: 0,
+          added,
           removed: 0,
           status: "added",
         })
