@@ -162,6 +162,49 @@ export namespace File {
     state()
   }
 
+  type LineCache = {
+    size: number
+    mtime: number
+    lines: number
+  }
+
+  const lineCache = new Map<string, LineCache>()
+
+  function cacheKey(path: string) {
+    return path
+  }
+
+  function setCachedLines(path: string, size: number, mtime: number, lines: number) {
+    lineCache.set(cacheKey(path), { size, mtime, lines })
+  }
+
+  function getCachedLines(path: string, size: number, mtime: number) {
+    const cached = lineCache.get(cacheKey(path))
+    if (!cached) return
+    if (cached.size !== size) return
+    if (cached.mtime !== mtime) return
+    return cached.lines
+  }
+
+  async function countLinesStream(path: string) {
+    const reader = Bun.file(path).stream().getReader()
+    let lines = 0
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      for (const byte of chunk.value) {
+        if (byte === 10) lines++
+      }
+    }
+    return lines
+  }
+
+  function scheduleCount(path: string, size: number, mtime: number) {
+    countLinesStream(path)
+      .then((lines) => setCachedLines(path, size, mtime, lines))
+      .catch(() => {})
+  }
+
   export async function status() {
     const project = Instance.project
     if (project.vcs !== "git") return []
@@ -196,10 +239,27 @@ export namespace File {
         const full = path.join(Instance.directory, filepath)
         const stat = await Bun.file(full).stat().catch(() => undefined)
         if (!stat) continue
-        const added =
-          stat.size <= limit
-            ? (await Bun.file(full).text().catch(() => "")).split("\n").length
-            : 0
+        const size = stat.size ?? 0
+        const mtime = stat.mtime?.getTime?.() ?? 0
+        const bunFile = Bun.file(full)
+        const binary = await shouldEncode(bunFile)
+        if (binary) {
+          changedFiles.push({
+            path: filepath,
+            added: 0,
+            removed: 0,
+            status: "added",
+          })
+          continue
+        }
+        const cached = getCachedLines(filepath, size, mtime)
+        let added = cached ?? 0
+        if (added === 0 && size <= limit) {
+          added = (await bunFile.text().catch(() => "")).split("\n").length
+        }
+        if (added === 0) {
+          scheduleCount(full, size, mtime)
+        }
         changedFiles.push({
           path: filepath,
           added,
