@@ -202,9 +202,73 @@ export namespace File {
     state()
   }
 
+  type LineCache = {
+    size: number
+    mtime: number
+    lines: number
+  }
+
+  const lineCache = new Map<string, LineCache>()
+  const cacheFile = path.join(Instance.directory, ".opencode-line-cache.json")
+
+  async function loadCache() {
+    const file = Bun.file(cacheFile)
+    if (!(await file.exists())) return
+    const json = await file.json().catch(() => undefined)
+    if (!json) return
+    for (const [k, v] of Object.entries(json as Record<string, LineCache>)) {
+      lineCache.set(k, v)
+    }
+  }
+
+  async function saveCache() {
+    const obj: Record<string, LineCache> = {}
+    for (const [k, v] of lineCache.entries()) obj[k] = v
+    await Bun.write(cacheFile, JSON.stringify(obj))
+  }
+
+  function cacheKey(path: string) {
+    return path
+  }
+
+  function setCachedLines(path: string, size: number, mtime: number, lines: number) {
+    lineCache.set(cacheKey(path), { size, mtime, lines })
+    saveCache().catch(() => {})
+  }
+
+  function getCachedLines(path: string, size: number, mtime: number) {
+    const cached = lineCache.get(cacheKey(path))
+    if (!cached) return
+    if (cached.size !== size) return
+    if (cached.mtime !== mtime) return
+    return cached.lines
+  }
+
+  async function countLinesStream(path: string) {
+    const reader = Bun.file(path).stream().getReader()
+    let lines = 0
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      for (const byte of chunk.value) {
+        if (byte === 10) lines++
+      }
+    }
+    return lines
+  }
+
+  function scheduleCount(path: string, size: number, mtime: number, cap: number) {
+    if (size > cap) return
+    countLinesStream(path)
+      .then((lines) => setCachedLines(path, size, mtime, lines))
+      .catch(() => {})
+  }
+
   export async function status() {
     const project = Instance.project
     if (project.vcs !== "git") return []
+
+    await loadCache()
 
     const diffOutput = await $`git diff --numstat HEAD`.cwd(Instance.directory).quiet().nothrow().text()
 
@@ -231,19 +295,39 @@ export namespace File {
 
     if (untrackedOutput.trim()) {
       const untrackedFiles = untrackedOutput.trim().split("\n")
+      const limit = 5_000_000
+      const streamCap = 100_000_000
       for (const filepath of untrackedFiles) {
-        try {
-          const content = await Bun.file(path.join(Instance.directory, filepath)).text()
-          const lines = content.split("\n").length
+        const full = path.join(Instance.directory, filepath)
+        const stat = await Bun.file(full).stat().catch(() => undefined)
+        if (!stat) continue
+        const size = stat.size ?? 0
+        const mtime = stat.mtime?.getTime?.() ?? 0
+        const bunFile = Bun.file(full)
+        const binary = await shouldEncode(bunFile)
+        if (binary) {
           changedFiles.push({
             path: filepath,
-            added: lines,
+            added: 0,
             removed: 0,
             status: "added",
           })
-        } catch {
           continue
         }
+        const cached = getCachedLines(filepath, size, mtime)
+        let added = cached ?? 0
+        if (added === 0 && size <= limit) {
+          added = (await bunFile.text().catch(() => "")).split("\n").length
+        }
+        if (added === 0) {
+          scheduleCount(full, size, mtime, streamCap)
+        }
+        changedFiles.push({
+          path: filepath,
+          added,
+          removed: 0,
+          status: "added",
+        })
       }
     }
 
