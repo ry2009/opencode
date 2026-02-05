@@ -26,6 +26,95 @@ import { Global } from "@/global"
 export namespace Session {
   const log = Log.create({ service: "session" })
 
+  // Cache session metadata per project to avoid repeated full-disk scans (e.g. child-cycle hotkeys).
+  type SessionIndex = {
+    byID: Map<string, Info>
+    byParent: Map<string, Info[]>
+  }
+
+  const indexByProject = new Map<string, Promise<SessionIndex>>()
+
+  async function buildIndex(projectID: string): Promise<SessionIndex> {
+    const byID = new Map<string, Info>()
+    const byParent = new Map<string, Info[]>()
+
+    for (const item of await Storage.list(["session", projectID])) {
+      const session = await Storage.read<Info>(item)
+      byID.set(session.id, session)
+      if (session.parentID) {
+        const list = byParent.get(session.parentID) ?? []
+        list.push(session)
+        byParent.set(session.parentID, list)
+      }
+    }
+
+    for (const list of byParent.values()) {
+      list.sort((a, b) => b.id.localeCompare(a.id))
+    }
+
+    return { byID, byParent }
+  }
+
+  function getIndex(projectID: string) {
+    let cached = indexByProject.get(projectID)
+    if (!cached) {
+      cached = buildIndex(projectID)
+      indexByProject.set(projectID, cached)
+    }
+    return cached
+  }
+
+  async function upsertIndex(session: Info) {
+    const index = await getIndex(session.projectID)
+    const existing = index.byID.get(session.id)
+
+    if (existing?.parentID && existing.parentID !== session.parentID) {
+      const oldList = index.byParent.get(existing.parentID)
+      if (oldList) {
+        index.byParent.set(
+          existing.parentID,
+          oldList.filter((x) => x.id !== session.id),
+        )
+        if ((index.byParent.get(existing.parentID)?.length ?? 0) === 0) {
+          index.byParent.delete(existing.parentID)
+        }
+      }
+    }
+
+    index.byID.set(session.id, session)
+
+    if (session.parentID) {
+      const list = index.byParent.get(session.parentID) ?? []
+      const found = list.findIndex((x) => x.id === session.id)
+      if (found === -1) list.push(session)
+      if (found !== -1) list[found] = session
+      list.sort((a, b) => b.id.localeCompare(a.id))
+      index.byParent.set(session.parentID, list)
+    }
+  }
+
+  async function removeFromIndex(projectID: string, sessionID: string) {
+    const cached = indexByProject.get(projectID)
+    if (!cached) return
+    const index = await cached
+    const existing = index.byID.get(sessionID)
+    if (!existing) return
+
+    index.byID.delete(sessionID)
+
+    if (existing.parentID) {
+      const list = index.byParent.get(existing.parentID)
+      if (!list) return
+      index.byParent.set(
+        existing.parentID,
+        list.filter((x) => x.id !== sessionID),
+      )
+      if ((index.byParent.get(existing.parentID)?.length ?? 0) === 0) {
+        index.byParent.delete(existing.parentID)
+      }
+    }
+  }
+
   const parentTitlePrefix = "New session - "
   const childTitlePrefix = "Child session - "
 
@@ -212,6 +301,7 @@ export namespace Session {
     }
     log.info("created", result)
     await Storage.write(["session", Instance.project.id, result.id], result)
+    await upsertIndex(result)
     Bus.publish(Event.Created, {
       info: result,
     })
@@ -278,6 +368,7 @@ export namespace Session {
       editor(draft)
       draft.time.updated = Date.now()
     })
+    await upsertIndex(result)
     Bus.publish(Event.Updated, {
       info: result,
     })
@@ -306,21 +397,15 @@ export namespace Session {
   )
 
   export async function* list() {
-    const project = Instance.project
-    for (const item of await Storage.list(["session", project.id])) {
-      yield Storage.read<Info>(item)
+    const index = await getIndex(Instance.project.id)
+    for (const session of index.byID.values()) {
+      yield session
     }
   }
 
   export const children = fn(Identifier.schema("session"), async (parentID) => {
-    const project = Instance.project
-    const result = [] as Session.Info[]
-    for (const item of await Storage.list(["session", project.id])) {
-      const session = await Storage.read<Info>(item)
-      if (session.parentID !== parentID) continue
-      result.push(session)
-    }
-    return result
+    const index = await getIndex(Instance.project.id)
+    return index.byParent.get(parentID) ?? []
   })
 
   export const remove = fn(Identifier.schema("session"), async (sessionID) => {
@@ -338,6 +423,7 @@ export namespace Session {
         await Storage.remove(msg)
       }
       await Storage.remove(["session", project.id, sessionID])
+      await removeFromIndex(project.id, sessionID)
       Bus.publish(Event.Deleted, {
         info: session,
       })
